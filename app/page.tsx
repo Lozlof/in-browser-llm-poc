@@ -13,6 +13,9 @@ export default function Page() {
         <li>
           <Link href="/SmolLM2-135M-Instruct">SmolLM2-135M-Instruct</Link>
         </li>
+        <li>
+          <Link href="/llama2.c-stories15M">llama2.c-stories15M</Link>
+        </li>
       </ul>
     </main>
   );

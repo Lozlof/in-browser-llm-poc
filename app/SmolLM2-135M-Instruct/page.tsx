@@ -1,30 +1,33 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useRef, useState } from "react";
 
-type TextGenPipeline = (
+type TextGenOptions = {
+  max_new_tokens?: number;
+  temperature?: number;
+  top_p?: number;
+  do_sample?: boolean;
+};
+
+type TextGenResult = Array<{ generated_text: unknown }>;
+
+// Pipeline type with optional dispose()
+type DisposablePipeline = ((
   input: string,
-  options?: {
-    max_new_tokens?: number;
-    temperature?: number;
-    top_p?: number;
-    do_sample?: boolean;
-    repetition_penalty?: number;
-  }
-) => Promise<Array<{ generated_text: unknown }>>;
+  options?: TextGenOptions
+) => Promise<TextGenResult>) & {
+  dispose?: () => Promise<void>;
+};
 
 function getErrorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   return String(err);
 }
 
-function extractText(result: Array<{ generated_text: unknown }>): string {
+function extractText(result: TextGenResult): string {
   const v = result?.[0]?.generated_text;
-
-  // Common case for plain text-generation: generated_text is a string
   if (typeof v === "string") return v;
 
-  // Some models return arrays/objects (fallback)
   try {
     return JSON.stringify(result, null, 2);
   } catch {
@@ -33,104 +36,96 @@ function extractText(result: Array<{ generated_text: unknown }>): string {
 }
 
 export default function Page() {
-  const [ready, setReady] = useState(false);
-  const [loadingModel, setLoadingModel] = useState(false);
-  const [generating, setGenerating] = useState(false);
-
+  const [status, setStatus] = useState<
+    "idle" | "loading" | "running" | "error"
+  >("idle");
   const [prompt, setPrompt] = useState(
     "Answer in one sentence: What is the capital of France?"
   );
   const [output, setOutput] = useState("");
 
-  const [generator, setGenerator] = useState<TextGenPipeline | null>(null);
+  const pipelineRef = useRef<DisposablePipeline | null>(null);
 
-  const modelId = useMemo(() => "HuggingFaceTB/SmolLM2-135M-Instruct", []);
+  const modelId = "HuggingFaceTB/SmolLM2-135M-Instruct";
 
-  async function loadModel() {
-    setLoadingModel(true);
-    setOutput("");
+  async function loadPipeline(): Promise<DisposablePipeline> {
+    if (pipelineRef.current) return pipelineRef.current;
 
-    try {
-      const { pipeline, env } = await import("@huggingface/transformers");
+    const { pipeline, env } = await import("@huggingface/transformers");
 
-      // Prefer WebGPU when available (faster, often better UX).
-      // WASM can be smaller in some cases, but usually slower.
-      // You can force one or the other.
-      const hasWebGPU = typeof navigator !== "undefined" && "gpu" in navigator;
+    // 🔒 HARD REQUIREMENTS
+    // CPU-only
+    const device = "wasm";
 
-      // Transformers.js settings knobs:
-      env.allowLocalModels = false; // keep it simple
-      // Optional: reduce caching behavior. If you want least disk usage:
-      // env.useBrowserCache = false;
+    // q4 quantization (will only work if model_q4.onnx exists)
+    const dtype = "q4";
 
-      const device = hasWebGPU ? "webgpu" : "wasm";
+    // Optional safety knobs
+    env.allowLocalModels = false;
+    env.useBrowserCache = true; // cache ONNX files, not runtime tensors
 
-      const gen = (await pipeline("text-generation", modelId, {
-        device,
-      })) as unknown as TextGenPipeline;
+    const p = (await pipeline("text-generation", modelId, {
+      device,
+      dtype,
+    })) as unknown as DisposablePipeline;
 
-      setGenerator(() => gen);
-      setReady(true);
-    } catch (err: unknown) {
-      setOutput(`Failed to load model.\n\n${getErrorMessage(err)}`);
-      setReady(false);
-      setGenerator(null);
-    } finally {
-      setLoadingModel(false);
+    pipelineRef.current = p;
+    return p;
+  }
+
+  async function disposePipeline() {
+    const p = pipelineRef.current;
+    pipelineRef.current = null;
+
+    if (p?.dispose) {
+      try {
+        await p.dispose();
+      } catch {
+        // ignore dispose errors
+      }
     }
   }
 
-  useEffect(() => {
-    // Load once up front. If you truly want “lowest footprint”,
-    // you can remove this and only load on demand.
-    void loadModel();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   async function runOnceAndFree() {
-    // Load on-demand if we previously freed it
-    if (!generator) {
-      await loadModel();
-    }
-    if (!generator) return;
-
-    setGenerating(true);
+    setStatus("loading");
     setOutput("");
 
     try {
-      const result = await generator(prompt, {
+      const gen = await loadPipeline();
+      setStatus("running");
+
+      const result = await gen(prompt, {
         max_new_tokens: 64,
         temperature: 0.2,
         top_p: 0.9,
         do_sample: true,
-        repetition_penalty: 1.05,
       });
 
       setOutput(extractText(result));
+      setStatus("idle");
     } catch (err: unknown) {
+      setStatus("error");
       setOutput(`Generation failed.\n\n${getErrorMessage(err)}`);
     } finally {
-      setGenerating(false);
-
-      // Drop references so GC can reclaim *everything it can*.
-      // This won’t always instantly shrink memory (GC is nondeterministic),
-      // but it is the correct “free it” signal in JS.
-      setGenerator(null);
-      setReady(false);
+      // 🔥 Blow everything away after the response
+      await disposePipeline();
     }
   }
 
   return (
     <main style={{ padding: "2rem", maxWidth: 900, margin: "0 auto" }}>
       <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 12 }}>
-        SmolLM2 (min-footprint mode)
+        SmolLM2-135M (CPU-only · q4 · disposable)
       </h1>
 
       <p style={{ marginBottom: 16 }}>
         Model: <code>{modelId}</code>
         <br />
-        Status:{" "}
-        {loadingModel ? "loading model…" : ready ? "ready" : "not loaded"}
+        Backend: <code>wasm</code>
+        <br />
+        Quantization: <code>q4</code>
+        <br />
+        Status: <b>{status}</b>
       </p>
 
       <label style={{ display: "block", fontWeight: 600, marginBottom: 8 }}>
@@ -152,37 +147,22 @@ export default function Page() {
         }}
       />
 
-      <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
-        <button
-          onClick={runOnceAndFree}
-          disabled={generating || loadingModel}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 10,
-            border: "1px solid #ccc",
-            cursor: generating || loadingModel ? "not-allowed" : "pointer",
-          }}
-        >
-          {generating ? "Generating…" : "Generate (then free model)"}
-        </button>
-
-        <button
-          onClick={() => {
-            // Manual “panic free”
-            setGenerator(null);
-            setReady(false);
-            setOutput("");
-          }}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 10,
-            border: "1px solid #ccc",
-            cursor: "pointer",
-          }}
-        >
-          Clear
-        </button>
-      </div>
+      <button
+        onClick={runOnceAndFree}
+        disabled={status === "loading" || status === "running"}
+        style={{
+          padding: "10px 14px",
+          borderRadius: 10,
+          border: "1px solid #ccc",
+          cursor:
+            status === "loading" || status === "running"
+              ? "not-allowed"
+              : "pointer",
+          marginBottom: 16,
+        }}
+      >
+        {status === "running" ? "Generating…" : "Generate (CPU q4)"}
+      </button>
 
       <label style={{ display: "block", fontWeight: 600, marginBottom: 8 }}>
         Output
