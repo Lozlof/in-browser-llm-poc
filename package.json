@@ -1,5 +1,5 @@
 {
-  "name": "xenova-distilgpt2-poc",
+  "name": "in-browser-llm-poc",
   "version": "0.1.0",
   "private": true,
   "scripts": {
